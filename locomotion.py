@@ -19,6 +19,11 @@ class LocomotionBrain(Node):
         self.robot_state = "searching"
         self.get_logger().info(f"Starting in state: {self.robot_state}")
 
+        # --- Sub-state for avoiding logic ---
+        self.avoid_state_phase = "stop" # Can be "stop" or "turn"
+        self.avoid_stop_start_time = None
+        self.avoid_stop_duration_sec = 0.3 # Stop for 0.3 seconds
+
         # --- Sensor Data Variables ---
         # We store the latest sensor data here
         self.current_obstacle_distance = 99.0
@@ -26,13 +31,15 @@ class LocomotionBrain(Node):
 
         # --- Parameters ---
         # You can tune these values!
-        self.obstacle_threshold = 0.5  # meters
+        self.obstacle_threshold = 0.3  # meters (30cm)
         self.forward_speed = 0.1       # m/s
-        self.turn_speed = 0.4          # rad/s
-        self.scan_speed = 0.7          # rad/s (for 360 scan)
+        self.turn_speed = 0.8          # rad/s (Increased for a "sharper" turn)
+        self.scan_speed = 0.7          # rad/s (for scan)
         
-        # 2*pi radians is a full circle. 2*pi / 0.7 rad/s = ~8.97 seconds
-        self.scan_duration_sec = 10.0  # (10s > 8.97s, so it's a full 360)
+        # 2*pi radians is a full circle (~6.28 rad).
+        # A 150-degree scan is ~2.62 rad.
+        # 2.62 rad / 0.7 rad/s = ~3.74 seconds
+        self.scan_duration_sec = 4.0  # (4s * 0.7rad/s = 2.8rad, ~160 deg scan)
         self.scan_start_time = None
 
         # --- Publishers and Subscribers ---
@@ -60,12 +67,21 @@ class LocomotionBrain(Node):
     def scan_callback(self, msg):
         """Callback for LaserScan data. Updates the obstacle distance."""
         # msg.ranges[0] is the beam directly in front.
-        # Check for 'inf' (infinity) or 'nan' (not a number)
-        if msg.ranges[0] == float('inf'):
+        front_distance = msg.ranges[0]
+
+        # Log the raw front distance for tuning
+        self.get_logger().info(f"Front distance: {front_distance}")
+
+        if front_distance == float('inf'):
+            # No obstacle seen, path is clear
             self.current_obstacle_distance = 99.0
-        elif not msg.ranges[0] == float('nan'):
-            self.current_obstacle_distance = msg.ranges[0]
-        # if it's 'nan', we just keep the previous value
+        elif front_distance == float('nan'):
+            # 'nan' often means the sensor is too close or saturated.
+            # Treat this as a "blocked" signal to be safe.
+            self.current_obstacle_distance = 0.0 # Force a "blocked" state
+        else:
+            # We have a valid distance reading
+            self.current_obstacle_distance = front_distance
 
     def tag_callback(self, msg):
         """Callback for AprilTag data. Updates tag visibility."""
@@ -95,7 +111,10 @@ class LocomotionBrain(Node):
             elif is_blocked:
                 # Hit a wall! Switch to avoiding.
                 self.robot_state = "avoiding"
-                self.get_logger().info("--> STATE: AVOIDING")
+                # --- RESET AVOID LOGIC ---
+                self.avoid_state_phase = "stop" # Reset phase to "stop"
+                self.avoid_stop_start_time = self.get_clock().now()
+                self.get_logger().info("--> STATE: AVOIDING (Phase: Stop)")
 
         elif self.robot_state == "avoiding":
             if not is_blocked:
@@ -127,13 +146,28 @@ class LocomotionBrain(Node):
             twist_msg.angular.z = 0.0
 
         elif self.robot_state == "avoiding":
-            # Stop forward motion
-            twist_msg.linear.x = 0.0
-            # Turn based on 80/20 chance
-            if random.random() < 0.80:
-                twist_msg.angular.z = -self.turn_speed  # Turn RIGHT
-            else:
-                twist_msg.angular.z = self.turn_speed   # Turn LEFT
+            
+            if self.avoid_state_phase == "stop":
+                # Phase 1: Just stop all motion to kill momentum
+                twist_msg.linear.x = 0.0
+                twist_msg.angular.z = 0.0
+                
+                # Check if stop duration has passed
+                if self.avoid_stop_start_time:
+                    elapsed_time = (self.get_clock().now() - self.avoid_stop_start_time).nanoseconds / 1e9
+                    if elapsed_time > self.avoid_stop_duration_sec:
+                        # Time's up, move to "turn" phase
+                        self.avoid_state_phase = "turn"
+                        self.get_logger().info("--> STATE: AVOIDING (Phase: Turn)")
+            
+            elif self.avoid_state_phase == "turn":
+                # Phase 2: Now that we've stopped, turn in place
+                twist_msg.linear.x = 0.0
+                # Turn based on 80/20 chance
+                if random.random() < 0.80:
+                    twist_msg.angular.z = -self.turn_speed  # Turn RIGHT
+                else:
+                    twist_msg.angular.z = self.turn_speed   # Turn LEFT
 
         elif self.robot_state == "scanning":
             # Stop forward motion and spin
