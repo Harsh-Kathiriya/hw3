@@ -1,198 +1,136 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, qos_profile_sensor_data
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 from apriltag_msgs.msg import AprilTagDetectionArray
-from rclpy.qos import qos_profile_sensor_data
-import random
+import time
+import math
 
-class LocomotionBrain(Node):
+class Locomotion(Node):
 
     def __init__(self):
-        super().__init__('turtlebot3_brain')
+        super().__init__('turtlebot3_locomotion')
 
-        # --- State Machine Variable ---
-        # The robot can be in one of three states:
-        # "searching": Moving forward, looking for tags
-        # "avoiding": Obstacle detected, turning
-        # "scanning": Tag detected, doing a 360 spin
-        self.robot_state = "searching"
-        self.get_logger().info(f"Starting in state: {self.robot_state}")
+        # --- PUBLISHERS ---
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 1)
 
-        # --- Sub-state for avoiding logic ---
-        self.avoid_state_phase = "stop" # Can be "stop" or "turn"
-        self.avoid_stop_start_time = None
-        self.avoid_stop_duration_sec = 0.3 # Stop for 0.3 seconds
-
-        # --- Sensor Data Variables ---
-        # We store the latest sensor data here
-        self.current_obstacle_distance = 99.0
-        self.is_tag_visible = False
-
-        # --- Parameters ---
-        # You can tune these values!
-        self.obstacle_threshold = 0.3  # meters (30cm)
-        self.forward_speed = 0.1       # m/s
-        self.turn_speed = 0.8          # rad/s (Increased for a "sharper" turn)
-        self.scan_speed = 0.7          # rad/s (for scan)
-        
-        # 2*pi radians is a full circle (~6.28 rad).
-        # A 150-degree scan is ~2.62 rad.
-        # 2.62 rad / 0.7 rad/s = ~3.74 seconds
-        self.scan_duration_sec = 4.0  # (4s * 0.7rad/s = 2.8rad, ~160 deg scan)
-        self.scan_start_time = None
-
-        # --- Publishers and Subscribers ---
-        # Publisher for robot movement
-        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
-
-        # Subscriber for LaserScan data
-        self.scan_subscription = self.create_subscription(
+        # --- SUBSCRIBERS ---
+        self.scan_sub = self.create_subscription(
             LaserScan,
             '/scan',
             self.scan_callback,
-            qos_profile_sensor_data) # Use sensor data QoS
+            qos_profile_sensor_data
+        )
 
-        # Subscriber for AprilTag detections
-        self.tag_subscription = self.create_subscription(
+        self.tag_sub = self.create_subscription(
             AprilTagDetectionArray,
             '/detections',
             self.tag_callback,
-            10) # Default QoS is fine here
+            10
+        )
 
-        # --- Main Decision Timer ---
-        # We create a timer that runs the 'decision_loop' 10 times a second
-        self.decision_timer = self.create_timer(0.1, self.decision_loop)
+        # --- STATE VARIABLES ---
+        self.min_front_dist = 0.4  # Distance to stop from wall
+        self.seen_tags = set()     # Memory of tags we have already scanned
+        
+        # Flags for State Machine
+        self.is_blocked = False
+        self.is_scanning_tag = False
+        self.scan_start_time = 0.0
+
+    def create_twist_msg(self, x, z):
+        t = Twist()
+        t.linear.x = float(x)
+        t.angular.z = float(z)
+        return t
 
     def scan_callback(self, msg):
-        """Callback for LaserScan data. Updates the obstacle distance."""
-        # msg.ranges[0] is the beam directly in front.
-        front_distance = msg.ranges[0]
-
-        # Log the raw front distance for tuning
-        self.get_logger().info(f"Front distance: {front_distance}")
-
-        if front_distance == float('inf'):
-            # No obstacle seen, path is clear
-            self.current_obstacle_distance = 99.0
-        elif front_distance == float('nan'):
-            # 'nan' often means the sensor is too close or saturated.
-            # Treat this as a "blocked" signal to be safe.
-            self.current_obstacle_distance = 0.0 # Force a "blocked" state
+        """
+        Handles Lidar data. 
+        Silent logic.
+        """
+        front_cone = msg.ranges[0:20] + msg.ranges[-20:]
+        
+        valid_ranges = [
+            r for r in front_cone 
+            if not math.isnan(r) and not math.isinf(r) and r > 0.01
+        ]
+        
+        if valid_ranges:
+            min_distance = min(valid_ranges)
+            if min_distance < self.min_front_dist:
+                self.is_blocked = True
+            else:
+                self.is_blocked = False
         else:
-            # We have a valid distance reading
-            self.current_obstacle_distance = front_distance
+            self.is_blocked = False
+        
+        self.decide_movement()
 
     def tag_callback(self, msg):
-        """Callback for AprilTag data. Updates tag visibility."""
+        """
+        Handles AprilTag detections.
+        Only prints if the tag is NEW.
+        """
         if len(msg.detections) > 0:
-            self.is_tag_visible = True
-            # Log the tag ID *only* if we are not already scanning
-            if self.robot_state != "scanning":
-                self.get_logger().info(f"Tag {msg.detections[0].id} spotted!")
-        else:
-            self.is_tag_visible = False
-
-    def decision_loop(self):
-        """This is the "brain" of the robot, running 10x/sec."""
-        
-        # --- 1. State Transition Logic ---
-        # First, decide if we need to CHANGE states
-        
-        is_blocked = self.current_obstacle_distance < self.obstacle_threshold
-
-        if self.robot_state == "searching":
-            if self.is_tag_visible:
-                # Found a tag! Switch to scanning.
-                self.robot_state = "scanning"
-                self.get_logger().info("--> STATE: SCANNING")
-                # Record the time we started scanning
-                self.scan_start_time = self.get_clock().now()
-            elif is_blocked:
-                # Hit a wall! Switch to avoiding.
-                self.robot_state = "avoiding"
-                # --- RESET AVOID LOGIC ---
-                self.avoid_state_phase = "stop" # Reset phase to "stop"
-                self.avoid_stop_start_time = self.get_clock().now()
-                self.get_logger().info("--> STATE: AVOIDING (Phase: Stop)")
-
-        elif self.robot_state == "avoiding":
-            if not is_blocked:
-                # Path is clear. Go back to searching.
-                self.robot_state = "searching"
-                self.get_logger().info("--> STATE: SEARCHING (path is clear)")
-
-        elif self.robot_state == "scanning":
-            # Check if our scan time is up
-            if self.scan_start_time is None:
-                 self.robot_state = "searching" # Safety check
-                 return
-                 
-            elapsed_time = (self.get_clock().now() - self.scan_start_time).nanoseconds / 1e9
-            if elapsed_time > self.scan_duration_sec:
-                # Scan is complete. Go back to searching.
-                self.robot_state = "searching"
-                self.get_logger().info(f"--> STATE: SEARCHING (scan complete)")
-                self.scan_start_time = None
-
-        # --- 2. Action Logic ---
-        # Now, set motor commands based on our CURRENT state
-        
-        twist_msg = Twist()
-
-        if self.robot_state == "searching":
-            # Move forward
-            twist_msg.linear.x = self.forward_speed
-            twist_msg.angular.z = 0.0
-
-        elif self.robot_state == "avoiding":
+            tag_id = msg.detections[0].id
             
-            if self.avoid_state_phase == "stop":
-                # Phase 1: Just stop all motion to kill momentum
-                twist_msg.linear.x = 0.0
-                twist_msg.angular.z = 0.0
+            # Check if we have seen this tag before
+            if tag_id not in self.seen_tags:
+                # If we are currently doing a spin for a previous tag, 
+                # we might still "see" a new one. 
+                # This logic ensures we capture it and print it.
                 
-                # Check if stop duration has passed
-                if self.avoid_stop_start_time:
-                    elapsed_time = (self.get_clock().now() - self.avoid_stop_start_time).nanoseconds / 1e9
-                    if elapsed_time > self.avoid_stop_duration_sec:
-                        # Time's up, move to "turn" phase
-                        self.avoid_state_phase = "turn"
-                        self.get_logger().info("--> STATE: AVOIDING (Phase: Turn)")
+                self.seen_tags.add(tag_id)
+                
+                # THIS IS THE ONLY PRINT STATEMENT IN THE CODE
+                print(f"Tag detected {tag_id}")
+
+                # Trigger the scan/spin behavior
+                if not self.is_scanning_tag:
+                    self.is_scanning_tag = True
+                    self.scan_start_time = time.time()
+
+    def decide_movement(self):
+        """
+        Main State Machine (Silent)
+        """
+        twist = Twist()
+
+        # PRIORITY 1: Scanning Routine (7 Seconds)
+        if self.is_scanning_tag:
+            elapsed_time = time.time() - self.scan_start_time
             
-            elif self.avoid_state_phase == "turn":
-                # Phase 2: Now that we've stopped, turn in place
-                twist_msg.linear.x = 0.0
-                # Turn based on 80/20 chance
-                if random.random() < 0.80:
-                    twist_msg.angular.z = -self.turn_speed  # Turn RIGHT
-                else:
-                    twist_msg.angular.z = self.turn_speed   # Turn LEFT
+            if elapsed_time < 7.0:
+                twist = self.create_twist_msg(0.0, 0.5) # Spin
+            else:
+                self.is_scanning_tag = False
+                twist = self.create_twist_msg(0.0, 0.0)
+        
+        # PRIORITY 2: Obstacle Avoidance
+        elif self.is_blocked:
+            twist = self.create_twist_msg(0.0, 0.5) # Turn
 
-        elif self.robot_state == "scanning":
-            # Stop forward motion and spin
-            twist_msg.linear.x = 0.0
-            twist_msg.angular.z = self.scan_speed # Spin LEFT (positive)
+        # PRIORITY 3: Move Forward
+        else:
+            twist = self.create_twist_msg(0.20, 0.0) # Forward
 
-        # --- 3. Publish Action ---
-        # Send the command to the robot
-        self.publisher_.publish(twist_msg)
-
+        self.cmd_vel_pub.publish(twist)
 
 def main(args=None):
     rclpy.init(args=args)
-    locomotion_brain = LocomotionBrain()
+    
+    node = Locomotion()
+    
     try:
-        rclpy.spin(locomotion_brain)
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        # Stop the robot when shutting down
-        stop_msg = Twist()
-        locomotion_brain.publisher_.publish(stop_msg)
-        locomotion_brain.get_logger().info("Shutting down, stopping robot.")
-        
-        locomotion_brain.destroy_node()
+        stop_twist = Twist()
+        node.cmd_vel_pub.publish(stop_twist)
+        node.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
